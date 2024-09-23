@@ -9,17 +9,19 @@ import (
 )
 
 type RubyEnvironmentCollection struct {
-	userHomeDir               string
-	RubyEnvironmentsMap       map[string]RubyEnvironment
-	RubyEnvironmentsGlobalMap map[string]RubyEnvironment
+	BaseRvmPath                       string
+	UserHomeRubyEnvironmentsMap       map[string]RubyEnvironment
+	RubyEnvironmentsWithGlobalGemsMap map[string]RubyEnvironment // global gems ruby-3.3.5@global
+	SystemWideRubyInstallationMap     map[string]RubyEnvironment
 }
 
-func GetNewRubyEnvironmentCollection(userHomeDir string) (RubyEnvironmentCollection, error) {
+func GetNewRubyEnvironmentCollection(baseRvmPath string) (RubyEnvironmentCollection, error) {
 
 	rubyEnvCollection := RubyEnvironmentCollection{
-		userHomeDir:               userHomeDir,
-		RubyEnvironmentsMap:       make(map[string]RubyEnvironment),
-		RubyEnvironmentsGlobalMap: make(map[string]RubyEnvironment),
+		BaseRvmPath:                       baseRvmPath,
+		UserHomeRubyEnvironmentsMap:       make(map[string]RubyEnvironment),
+		RubyEnvironmentsWithGlobalGemsMap: make(map[string]RubyEnvironment),
+		SystemWideRubyInstallationMap:     make(map[string]RubyEnvironment),
 	}
 
 	return rubyEnvCollection, nil
@@ -30,13 +32,12 @@ func (r *RubyEnvironmentCollection) ToJsonString() (string, error) {
 	return s, err
 }
 
-func (rec *RubyEnvironmentCollection) GetRvmDir() string {
-	rvmDir := filepath.Join(rec.userHomeDir, ".rvm")
-	return rvmDir
+func (r *RubyEnvironmentCollection) GetRvmDir() string {
+	return r.BaseRvmPath
 }
 
 func (r *RubyEnvironmentCollection) GetRubiesDir() string {
-	return filepath.Join(r.GetRvmDir(), "rubies")
+	return filepath.Join(r.GetRvmDir(), RubiesDirName)
 }
 
 func (r *RubyEnvironmentCollection) GetRubiesForVersion(version string) string {
@@ -44,7 +45,7 @@ func (r *RubyEnvironmentCollection) GetRubiesForVersion(version string) string {
 }
 
 func (r *RubyEnvironmentCollection) GetGemsDir() string {
-	return filepath.Join(r.GetRvmDir(), "gems")
+	return filepath.Join(r.GetRvmDir(), GemsDirName)
 }
 
 func (r *RubyEnvironmentCollection) FindRubyEnvironments() error {
@@ -67,37 +68,103 @@ func (r *RubyEnvironmentCollection) FindRubyEnvironments() error {
 		r.AddRubyEnvironmentToCollection(version)
 	}
 
+	err = r.AddSystemWideRubyEnvironments()
+	if err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func (r *RubyEnvironmentCollection) FindRubyEnvironmentForRake(rakeIdStr string) (RubyEnvironment, error) {
+	return RubyEnvironment{}, nil
 }
 
 func (r *RubyEnvironmentCollection) AddRubyEnvironmentToCollection(version string) {
 
 	gemsDir, err := r.IsGemsDirFound(version, false)
-
 	if err == nil {
 		rubiesDirForVersion := r.GetRubiesForVersion(version)
 		rubyEnv := GetNewRubyEnvironment(version, rubiesDirForVersion, gemsDir, false)
-		r.RubyEnvironmentsMap[version] = rubyEnv
-	} else {
-		fmt.Println(`r.IsGemsDirFound(version, false) failed for version`, version, " err == ", err.Error())
+		r.UserHomeRubyEnvironmentsMap[version] = rubyEnv
 	}
 
 	gemsGlobalDir, err := r.IsGemsDirFound(version, true)
 	if err == nil {
 		rubiesDirForVersion := r.GetRubiesForVersion(version)
 		rubyEnv := GetNewRubyEnvironment(version, rubiesDirForVersion, gemsGlobalDir, true)
-		r.RubyEnvironmentsGlobalMap[version] = rubyEnv
-	} else {
-		fmt.Println(`r.IsGemsDirFound(version, true) failed for version`, version, " err == ", err.Error())
+		r.RubyEnvironmentsWithGlobalGemsMap[version] = rubyEnv
 	}
 
 }
 
-func (r *RubyEnvironmentCollection) IsGemsDirFound(version string, isCheckGlobal bool) (string, error) {
+func (r *RubyEnvironmentCollection) AddSystemWideRubyEnvironments() error {
+
+	rubyExeList := []string{RubyInterpreterName, JrubyInterpreterName}
+
+	sysPathDirs, _ := GetExecutablePathDirs()
+
+	for _, rubyExe := range rubyExeList {
+		for _, pathDir := range sysPathDirs {
+			r.CheckSysPathDirForRubyInstallation(pathDir, rubyExe)
+		}
+	}
+
+	return nil
+}
+
+func (r *RubyEnvironmentCollection) CheckSysPathDirForRubyInstallation(sysPath, rubyExeName string) {
+
+	absoluteRubyPath := filepath.Join(sysPath, rubyExeName)
+	_, err := os.Stat(absoluteRubyPath)
+	if os.IsNotExist(err) {
+		return
+	}
+
+	parentDir := filepath.Dir(sysPath)
+	possibleLibPath := []string{LibRubySuffix, GemsSuffix}
+
+	for _, libPath := range possibleLibPath {
+		rubyLibPath := filepath.Join(parentDir, libPath)
+
+		if !IsFileOrDirExists(rubyLibPath) {
+			continue
+		}
+
+		versionsList, err := GetRubyVersionDirs(rubyLibPath)
+		if err != nil {
+			continue
+		}
+
+		for _, version := range versionsList {
+
+			if _, found := r.SystemWideRubyInstallationMap[version]; found {
+				continue
+			}
+
+			specificationsDir := filepath.Join(rubyLibPath, version, "specifications")
+			rakeGemSpecs, err := FindRakeGemspecs(specificationsDir)
+			if err != nil {
+				// fmt.Println("rakeGemSpecs not found")
+				continue
+			}
+
+			if len(rakeGemSpecs) > 0 {
+				gemsPath := filepath.Join(rubyLibPath, version)
+				rubyEnv := GetNewRubyEnvironment(version, parentDir, gemsPath, false)
+				r.SystemWideRubyInstallationMap[version] = rubyEnv
+				return // return on first find
+			}
+		}
+
+	}
+}
+
+func (r *RubyEnvironmentCollection) IsGemsDirFound(version string, isCheckGlobalGem bool) (string, error) {
 
 	gemsDir := filepath.Join(r.GetGemsDir(), RubyDirPrefix+version)
 
-	if isCheckGlobal {
+	if isCheckGlobalGem {
 		gemsDir += "@global"
 	}
 
@@ -115,10 +182,9 @@ func (r *RubyEnvironmentCollection) FindAllInstalledVersions() ([]string, error)
 	rubyPattern := regexp.MustCompile(`^ruby-(\d+\.\d+\.\d+)$`)
 
 	rubiesDir := r.GetRubiesDir()
-
 	rubiesDirList, err := os.ReadDir(rubiesDir)
 	if err != nil {
-		fmt.Println("FindAllInstalledVersions os.ReadDir failed", err)
+		// fmt.Println("FindAllInstalledVersions os.ReadDir failed", err)
 		return nil, err
 	}
 
@@ -154,3 +220,6 @@ func GetNewRubyEnvironment(version, rubyPath, gemPath string, isGlobalGem bool) 
 	}
 	return rubyEnv
 }
+
+//
+//
